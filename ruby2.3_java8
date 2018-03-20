@@ -1,0 +1,140 @@
+FROM ubuntu:14.04
+MAINTAINER dewar@0019@gmail.com
+
+ENV RAILS_ENV 'production'
+ARG RAILS_VERSION=3.2.22
+ARG RUBY_MAJOR=2.3
+ARG RUBY_VERSION=2.3.3
+ARG RUBY_DOWNLOAD_SHA256=1a4fa8c2885734ba37b97ffdb4a19b8fba0e8982606db02d936e65bac07419dc
+ARG RUBYGEMS_VERSION=2.5.2
+ARG BUNDLER_VERSION=1.15.3
+
+ENV JAVA_BASEDIR="/usr/java"
+ENV JAVA_HOME="$JAVA_BASEDIR/jdk1.8.0_141"
+
+ARG JAVA_TMPFILE="/tmp/jdk8-download.tar.gz"
+ARG JAVA_URL="http://download.oracle.com/otn-pub/java/jdk/8u141-b15/336fa29ff2bb4ef291e347e091f7f4a7/jdk-8u141-linux-i586.tar.gz"
+
+# Before we get started, we need to add i386 architecture.
+# Why?
+# Well, Oracle's JDK8 install requires a version of libc which is 32-bit
+# (yes, the 64-bit download) - for more details, see
+# http://stackoverflow.com/a/9082947
+RUN sudo dpkg --add-architecture i386
+
+RUN apt-get update && apt-get install -y -q software-properties-common init-system-helpers wget libc6-i386
+
+# Postgres 9.5
+RUN echo "deb http://apt.postgresql.org/pub/repos/apt/ precise-pgdg main" >> /etc/apt/sources.list.d/pgdg.list \
+      && wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
+      && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys F76221572C52609D 749D6EEC0353B12C
+
+RUN set -ex \
+	\
+	&& buildDeps=' \
+		bison \
+		libgdbm-dev \
+		xz-utils \
+		autoconf \
+		build-essential \
+		zlib1g-dev \
+		libssl-dev \
+		ruby \
+		libfontconfig1 \
+		libxext6 \
+		libxrender1 \
+	' \
+	&& additionalPackages=' \
+    git \
+    curl \
+    supervisor \
+    libpq-dev \
+    memcached \
+    nginx \
+    npm \
+    node \
+    lsof \
+    rabbitmq-server \
+    redis-server \
+    postgresql-9.5 \
+    postgresql-client-9.5 \
+    libreadline-dev \
+    runit \
+    nano \
+    unzip \
+    ttf-wqy-microhei \
+    ttf-wqy-zenhei \
+	' \
+  && add-apt-repository ppa:chris-lea/redis-server \
+	&& apt-get update \
+	&& apt-get install -y --no-install-recommends $buildDeps sudo $additionalPackages
+
+# Java 8 Installation
+RUN mkdir -p /usr/java
+RUN wget -q -O $JAVA_TMPFILE --no-check-certificate --header 'Cookie: oraclelicense=accept-securebackup-cookie' $JAVA_URL
+RUN tar -xf $JAVA_TMPFILE -C $JAVA_BASEDIR
+RUN rm $JAVA_TMPFILE
+
+# Switch over to using this version of Java by default
+RUN sudo update-alternatives --install /usr/bin/java java $JAVA_HOME/bin/java 100
+RUN sudo update-alternatives --install /usr/bin/javac javac $JAVA_HOME/bin/javac 100
+RUN sudo update-alternatives --install /usr/bin/jar jar $JAVA_HOME/bin/jar 100
+
+RUN sudo update-alternatives --set java $JAVA_HOME/bin/java
+RUN sudo update-alternatives --set javac $JAVA_HOME/bin/javac
+RUN sudo update-alternatives --set jar $JAVA_HOME/bin/jar
+
+# Now that JDK8 is installed, install the Java Crypto Extensions
+ARG JAVA_JCE_TMPFILE="/tmp/jdk8-jce-download.zip"
+ARG JAVA_JCE_URL="http://download.oracle.com/otn-pub/java/jce/8/jce_policy-8.zip"
+ENV JAVA_JCE_DIR="$JAVA_HOME/jre/lib/security"
+RUN wget -q -O $JAVA_JCE_TMPFILE --no-check-certificate --header 'Cookie: oraclelicense=accept-securebackup-cookie' $JAVA_JCE_URL
+
+# Extract the contents of our updated policy jars straight into their respective locations
+RUN sudo unzip -p $JAVA_JCE_TMPFILE UnlimitedJCEPolicyJDK8/local_policy.jar | sudo tee $JAVA_JCE_DIR/local_policy.jar > /dev/null
+RUN sudo unzip -p $JAVA_JCE_TMPFILE UnlimitedJCEPolicyJDK8/US_export_policy.jar | sudo tee $JAVA_JCE_DIR/US_export_policy.jar > /dev/null
+RUN rm $JAVA_JCE_TMPFILE
+
+# Remove and cleanup packages
+RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Update font cache for Japanese/Chinese characters
+RUN fc-cache -f -v
+
+# Install wkhtmltopdf
+ARG WKHTMLTOPDF_SHA256=40bc014d0754ea44bb90e733f03e7c92862f7445ef581e3599ecc00711dddcaa
+
+RUN cd ~ \
+  && wget -O wkhtmltopdf.tar.xz https://github.com/wkhtmltopdf/wkhtmltopdf/releases/download/0.12.3/wkhtmltox-0.12.3_linux-generic-amd64.tar.xz \
+  && echo "$WKHTMLTOPDF_SHA256 *wkhtmltopdf.tar.xz" | sha256sum -c - \
+  && tar vxf wkhtmltopdf.tar.xz \
+  && cp wkhtmltox/bin/wk* /usr/local/bin/ \
+  && rm -r wkhtmltopdf.tar.xz
+
+# Get Binaries for Ruby and Redis
+RUN wget -O ruby.tar.xz "https://cache.ruby-lang.org/pub/ruby/${RUBY_MAJOR%-rc}/ruby-$RUBY_VERSION.tar.xz" \
+	&& echo "$RUBY_DOWNLOAD_SHA256 *ruby.tar.xz" | sha256sum -c - \
+	&& mkdir -p /usr/src/ruby \
+	&& tar -xJf ruby.tar.xz -C /usr/src/ruby --strip-components=1 \
+	&& rm ruby.tar.xz
+
+# Install Ruby
+# hack in "ENABLE_PATH_CHECK" disabling to suppress: warning: Insecure world writable dir
+RUN cd /usr/src/ruby \
+   && { \
+     echo '#define ENABLE_PATH_CHECK 0'; \
+     echo; \
+     cat file.c; \
+   } > file.c.new \
+&& mv file.c.new file.c \
+&& autoconf \
+&& ./configure --disable-install-doc --enable-shared \
+&& make -j"$(nproc)" \
+&& make install \
+&& apt-get purge -y --auto-remove $buildDeps \
+&& cd / \
+&& rm -r /usr/src/ruby
+
+RUN gem update --system "$RUBYGEMS_VERSION"
+
+RUN gem install bundler --version "$BUNDLER_VERSION"
